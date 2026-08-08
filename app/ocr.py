@@ -386,6 +386,45 @@ def build_response_fields(parsed: ParsedMrz) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Visual zone (VIZ) fallback - the printed "Sex: M/F" field
+# --------------------------------------------------------------------------
+
+# "Sex" label variants across passports (English/French/Spanish), followed by
+# a short gap of separators, then a single M or F. The letter is Latin even on
+# Arabic-script passports.
+_VIZ_SEX_RE = re.compile(
+    r"\b(?:sex|sexe|sexo)\b[^A-Za-z0-9]{0,8}([MF])\b", re.IGNORECASE
+)
+
+
+def extract_viz_sex(img: np.ndarray) -> Optional[str]:
+    """Full-page OCR looking for the printed Sex field. Returns 'M'/'F' or None."""
+    img = _upscale_if_needed(img)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+
+    votes = []
+    for variant in (gray, clahe):
+        for rotated in (variant, cv2.rotate(variant, cv2.ROTATE_90_CLOCKWISE),
+                        cv2.rotate(variant, cv2.ROTATE_90_COUNTERCLOCKWISE)):
+            try:
+                text = pytesseract.image_to_string(rotated, config="--psm 11 --oem 3")
+            except Exception:  # noqa: BLE001
+                continue
+            m = _VIZ_SEX_RE.search(text)
+            if m:
+                votes.append(m.group(1).upper())
+    if not votes:
+        return None
+    # Require agreement if we got multiple reads
+    if votes.count("M") > votes.count("F"):
+        return "M"
+    if votes.count("F") > votes.count("M"):
+        return "F"
+    return None
+
+
+# --------------------------------------------------------------------------
 # Public entrypoint
 # --------------------------------------------------------------------------
 
@@ -393,11 +432,35 @@ def build_response_fields(parsed: ParsedMrz) -> dict:
 def parse_document(image_bytes: bytes) -> dict:
     """Full pipeline: raw image bytes -> structured MRZ response dict.
 
+    Falls back to visual-zone OCR of the printed Sex field when the MRZ is
+    unreadable or its gender character is garbled.
     Raises an OcrError subclass on any handled failure.
     """
     img = load_image(image_bytes)
-    parsed = extract_mrz(img)
+    try:
+        parsed = extract_mrz(img)
+    except MrzNotFoundError:
+        # MRZ unreadable - see if the printed Sex field is recoverable
+        sex = extract_viz_sex(img)
+        if sex:
+            return {
+                "success": True,
+                "mrz_type": "VIZ-ONLY",
+                "fields": {
+                    "surname": "", "given_names": "", "passport_number": "",
+                    "nationality": "", "date_of_birth": None,
+                    "gender": sex, "expiry_date": None, "issuing_country": "",
+                },
+                "raw_mrz": "",
+            }
+        raise
+
     fields = build_response_fields(parsed)
+    if fields.get("gender") == "X":
+        sex = extract_viz_sex(img)
+        if sex:
+            fields["gender"] = sex
+            fields["gender_source"] = "viz"
 
     return {
         "success": True,
