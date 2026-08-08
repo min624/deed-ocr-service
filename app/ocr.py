@@ -1,0 +1,301 @@
+"""
+MRZ (Machine Readable Zone) extraction and parsing for passports / ID cards.
+
+Pipeline:
+    bytes -> PIL/OpenCV image -> preprocess -> locate MRZ region
+          -> Tesseract OCR -> candidate line cleanup
+          -> mrz library (TD1 / TD2 / TD3 checkers) -> structured fields
+
+Everything below runs locally in-process. No network calls are made while
+handling image bytes, so passport/ID data never leaves the container.
+"""
+
+from __future__ import annotations
+
+import io
+import re
+from dataclasses import dataclass
+from datetime import date
+from typing import Optional
+
+import cv2
+import numpy as np
+import pytesseract
+from PIL import Image, UnidentifiedImageError
+
+from mrz.checker.td1 import TD1CodeChecker
+from mrz.checker.td2 import TD2CodeChecker
+from mrz.checker.td3 import TD3CodeChecker
+
+# --------------------------------------------------------------------------
+# Errors
+# --------------------------------------------------------------------------
+
+
+class OcrError(Exception):
+    """Base class for all handled OCR/MRZ failures. Carries an HTTP status."""
+
+    status_code = 400
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+class InvalidImageError(OcrError):
+    status_code = 400
+
+
+class ImageTooSmallError(OcrError):
+    status_code = 422
+
+
+class MrzNotFoundError(OcrError):
+    status_code = 422
+
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+MIN_DIMENSION_PX = 200  # reject images smaller than this on either axis
+MAX_UPSCALE_WIDTH = 1600  # cap upscaling so huge/tiny images normalize similarly
+
+MRZ_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
+TESSERACT_CONFIG = (
+    "--psm 6 --oem 3 "
+    f"-c tessedit_char_whitelist={MRZ_CHARSET}"
+)
+
+# (line_count, line_length, mrz_type, checker_class)
+_MRZ_SHAPES = [
+    (2, 44, "TD3", TD3CodeChecker),  # passports
+    (3, 30, "TD1", TD1CodeChecker),  # ID cards
+    (2, 36, "TD2", TD2CodeChecker),  # ID cards / visas
+]
+
+_LINE_TOKEN_RE = re.compile(r"[A-Z0-9<]{20,}")
+
+
+@dataclass
+class ParsedMrz:
+    mrz_type: str
+    fields: dict
+    raw_mrz: str
+
+
+# --------------------------------------------------------------------------
+# Image loading / preprocessing
+# --------------------------------------------------------------------------
+
+
+def load_image(image_bytes: bytes) -> np.ndarray:
+    """Decode raw bytes into a BGR OpenCV image, validating it's a real image."""
+    if not image_bytes:
+        raise InvalidImageError("Empty image payload.")
+    try:
+        pil_img = Image.open(io.BytesIO(image_bytes))
+        pil_img.load()
+    except UnidentifiedImageError as exc:
+        raise InvalidImageError("File is not a readable image.") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise InvalidImageError(f"Could not decode image: {exc}") from exc
+
+    width, height = pil_img.size
+    if width < MIN_DIMENSION_PX or height < MIN_DIMENSION_PX:
+        raise ImageTooSmallError(
+            f"Image too small ({width}x{height}px). "
+            f"Minimum {MIN_DIMENSION_PX}x{MIN_DIMENSION_PX}px required."
+        )
+
+    pil_img = pil_img.convert("RGB")
+    arr = np.array(pil_img)
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+def _upscale_if_needed(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    if w < MAX_UPSCALE_WIDTH:
+        scale = MAX_UPSCALE_WIDTH / float(w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+    return img
+
+
+def _preprocess_variants(img: np.ndarray):
+    """Yield a few preprocessed versions of the image to try OCR against.
+
+    Real-world passport photos vary a lot (lighting, skew, background), so
+    instead of a single "correct" pipeline we try a small set of cheap
+    variants and keep whichever one yields a valid MRZ.
+    """
+    img = _upscale_if_needed(img)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 1. Plain grayscale
+    yield gray
+
+    # 2. Otsu threshold (good for clean scans / high-contrast crops)
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield otsu
+
+    # 3. Adaptive threshold (good for uneven lighting / phone photos)
+    adaptive = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
+    )
+    yield adaptive
+
+    # 4. Bottom third only, upscaled further, Otsu-thresholded.
+    # The MRZ is always at the bottom of a passport/ID; isolating it removes
+    # noise from photos/backgrounds elsewhere in the frame.
+    h = gray.shape[0]
+    bottom = gray[int(h * 0.55):, :]
+    bottom = cv2.resize(bottom, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    _, bottom_otsu = cv2.threshold(bottom, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield bottom_otsu
+
+
+# --------------------------------------------------------------------------
+# OCR + line cleanup
+# --------------------------------------------------------------------------
+
+
+def _ocr_candidate_lines(img: np.ndarray) -> list[str]:
+    text = pytesseract.image_to_string(img, config=TESSERACT_CONFIG)
+    lines = []
+    for raw_line in text.splitlines():
+        cleaned = raw_line.strip().upper().replace(" ", "")
+        if not cleaned:
+            continue
+        match = _LINE_TOKEN_RE.search(cleaned)
+        if match:
+            lines.append(match.group(0))
+    return lines
+
+
+def _normalize_length(line: str, target_len: int) -> Optional[str]:
+    """Pad/trim a slightly-mis-OCR'd line to the expected MRZ line length.
+
+    Tesseract commonly drops a trailing filler '<' or two. We only correct
+    lines within 2 characters of the target to avoid fabricating data.
+    """
+    diff = target_len - len(line)
+    if diff == 0:
+        return line
+    if 0 < diff <= 2:
+        return line + ("<" * diff)
+    if -2 <= diff < 0:
+        return line[:target_len]
+    return None
+
+
+def _try_parse_shape(lines: list[str]) -> Optional[ParsedMrz]:
+    for count, length, mrz_type, checker_cls in _MRZ_SHAPES:
+        if len(lines) < count:
+            continue
+        # try every contiguous window of `count` lines, in case OCR picked
+        # up stray tokens before/after the actual MRZ block
+        for start in range(0, len(lines) - count + 1):
+            window = lines[start:start + count]
+            normalized = [_normalize_length(l, length) for l in window]
+            if any(n is None for n in normalized):
+                continue
+            mrz_text = "\n".join(normalized)
+            try:
+                checker = checker_cls(mrz_text)
+            except Exception:  # noqa: BLE001
+                continue
+            fields = checker.fields()
+            return ParsedMrz(mrz_type=mrz_type, fields=fields, raw_mrz=mrz_text)
+    return None
+
+
+def extract_mrz(img: np.ndarray) -> ParsedMrz:
+    best_lines: list[str] = []
+    for variant in _preprocess_variants(img):
+        lines = _ocr_candidate_lines(variant)
+        if len(lines) > len(best_lines):
+            best_lines = lines
+        parsed = _try_parse_shape(lines)
+        if parsed is not None:
+            return parsed
+
+    raise MrzNotFoundError(
+        "No valid MRZ block could be found in the image. "
+        "Make sure the machine-readable zone (bottom lines of the "
+        "passport/ID) is fully visible, in focus, and well lit."
+    )
+
+
+# --------------------------------------------------------------------------
+# Field normalization
+# --------------------------------------------------------------------------
+
+
+def _yymmdd_to_iso(value: str, *, is_expiry: bool) -> Optional[str]:
+    if not value or len(value) != 6 or not value.isdigit():
+        return None
+    yy, mm, dd = int(value[0:2]), int(value[2:4]), int(value[4:6])
+    if not (1 <= mm <= 12 and 1 <= dd <= 31):
+        return None
+
+    current_yy = date.today().year % 100
+    current_century = (date.today().year // 100) * 100
+
+    if is_expiry:
+        # Expiry dates are generally within ~15 years of "now"; if the
+        # 2-digit year looks like it's far in the past, it's next century.
+        century = current_century if yy >= current_yy - 1 else current_century + 100
+    else:
+        # Birth dates: assume no one in the dataset was born in the future.
+        century = current_century if yy <= current_yy else current_century - 100
+
+    try:
+        return date(century + yy, mm, dd).isoformat()
+    except ValueError:
+        return None
+
+
+def _clean_name(value: str) -> str:
+    return re.sub(r"<+", " ", value or "").strip()
+
+
+def build_response_fields(parsed: ParsedMrz) -> dict:
+    f = parsed.fields
+    surname = _clean_name(getattr(f, "surname", ""))
+    given_names = _clean_name(getattr(f, "name", ""))
+    sex = (getattr(f, "sex", "") or "").strip().upper()
+    if sex not in ("M", "F"):
+        sex = "X"
+
+    return {
+        "surname": surname,
+        "given_names": given_names,
+        "passport_number": (getattr(f, "document_number", "") or "").replace("<", "").strip(),
+        "nationality": (getattr(f, "nationality", "") or "").strip(),
+        "date_of_birth": _yymmdd_to_iso(getattr(f, "birth_date", ""), is_expiry=False),
+        "gender": sex,
+        "expiry_date": _yymmdd_to_iso(getattr(f, "expiry_date", ""), is_expiry=True),
+        "issuing_country": (getattr(f, "country", "") or "").strip(),
+    }
+
+
+# --------------------------------------------------------------------------
+# Public entrypoint
+# --------------------------------------------------------------------------
+
+
+def parse_document(image_bytes: bytes) -> dict:
+    """Full pipeline: raw image bytes -> structured MRZ response dict.
+
+    Raises an OcrError subclass on any handled failure.
+    """
+    img = load_image(image_bytes)
+    parsed = extract_mrz(img)
+    fields = build_response_fields(parsed)
+
+    return {
+        "success": True,
+        "mrz_type": parsed.mrz_type,
+        "fields": fields,
+        "raw_mrz": parsed.raw_mrz,
+    }
