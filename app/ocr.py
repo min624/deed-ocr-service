@@ -21,7 +21,7 @@ from typing import Optional
 import cv2
 import numpy as np
 import pytesseract
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from mrz.checker.td1 import TD1CodeChecker
 from mrz.checker.td2 import TD2CodeChecker
@@ -89,17 +89,40 @@ class ParsedMrz:
 # --------------------------------------------------------------------------
 
 
+def _pdf_to_image(pdf_bytes: bytes) -> Image.Image:
+    """Render the first page of a PDF to a PIL image at ~200 DPI."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise InvalidImageError("PDF received but PDF support unavailable.") from exc
+    try:
+        pdf = pdfium.PdfDocument(pdf_bytes)
+        page = pdf[0]
+        bitmap = page.render(scale=200 / 72)
+        return bitmap.to_pil()
+    except Exception as exc:  # noqa: BLE001
+        raise InvalidImageError(f"Could not render PDF: {exc}") from exc
+
+
 def load_image(image_bytes: bytes) -> np.ndarray:
-    """Decode raw bytes into a BGR OpenCV image, validating it's a real image."""
+    """Decode raw bytes into a BGR OpenCV image, validating it's a real image.
+
+    Accepts standard image formats and PDFs (first page rendered).
+    Honors EXIF orientation so phone photos come in upright.
+    """
     if not image_bytes:
         raise InvalidImageError("Empty image payload.")
-    try:
-        pil_img = Image.open(io.BytesIO(image_bytes))
-        pil_img.load()
-    except UnidentifiedImageError as exc:
-        raise InvalidImageError("File is not a readable image.") from exc
-    except Exception as exc:  # noqa: BLE001
-        raise InvalidImageError(f"Could not decode image: {exc}") from exc
+    if image_bytes[:5] == b"%PDF-":
+        pil_img = _pdf_to_image(image_bytes)
+    else:
+        try:
+            pil_img = Image.open(io.BytesIO(image_bytes))
+            pil_img.load()
+            pil_img = ImageOps.exif_transpose(pil_img)
+        except UnidentifiedImageError as exc:
+            raise InvalidImageError("File is not a readable image.") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise InvalidImageError(f"Could not decode image: {exc}") from exc
 
     width, height = pil_img.size
     if width < MIN_DIMENSION_PX or height < MIN_DIMENSION_PX:
@@ -152,6 +175,17 @@ def _preprocess_variants(img: np.ndarray):
     bottom = cv2.resize(bottom, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
     _, bottom_otsu = cv2.threshold(bottom, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     yield bottom_otsu
+
+    # 5. CLAHE contrast enhancement (glare / low-contrast phone photos)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    yield enhanced
+    _, enh_otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield enh_otsu
+
+    # 6. Rotations - passports are often photographed sideways
+    for rot in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180):
+        yield cv2.rotate(gray, rot)
 
 
 # --------------------------------------------------------------------------
@@ -209,15 +243,81 @@ def _try_parse_shape(lines: list[str]) -> Optional[ParsedMrz]:
     return None
 
 
+# TD3 line 2 layout: doc#(0-8) chk(9) nat(10-12) dob(13-18) chk(19) sex(20)
+# expiry(21-26) chk(27). Used for relaxed extraction when checksums fail.
+_TD3_LINE2_RE = re.compile(
+    r"^(?P<doc>[A-Z0-9<]{9})(?P<doc_chk>[0-9<])(?P<nat>[A-Z0-9<]{3})"
+    r"(?P<dob>\d{6})(?P<dob_chk>[0-9<])(?P<sex>[MF<X])"
+    r"(?P<exp>\d{6})(?P<exp_chk>[0-9<])"
+)
+
+
+def _relaxed_line2_extract(lines: list[str]) -> Optional[dict]:
+    """Positional TD3 line-2 parse for when strict checksum validation fails.
+
+    Only trusts fields with strong internal structure: sex must be M/F flanked
+    by two valid 6-digit dates. Field checksums are verified individually so a
+    garbled read can still yield a usable DOB or gender.
+    """
+    def check_digit_ok(value: str, chk: str) -> bool:
+        if not chk.isdigit():
+            return False
+        weights = [7, 3, 1]
+        total = 0
+        for i, ch in enumerate(value):
+            if ch.isdigit():
+                v = int(ch)
+            elif ch == "<":
+                v = 0
+            else:
+                v = ord(ch) - 55
+            total += v * weights[i % 3]
+        return total % 10 == int(chk)
+
+    for line in lines:
+        m = _TD3_LINE2_RE.match(line)
+        if not m:
+            continue
+        out = {}
+        if m.group("sex") in ("M", "F"):
+            # Trust sex only when at least one adjacent date passes its checksum
+            dob_ok = check_digit_ok(m.group("dob"), m.group("dob_chk"))
+            exp_ok = check_digit_ok(m.group("exp"), m.group("exp_chk"))
+            if dob_ok or exp_ok:
+                out["sex"] = m.group("sex")
+                if dob_ok:
+                    out["birth_date"] = m.group("dob")
+                if exp_ok:
+                    out["expiry_date"] = m.group("exp")
+                if check_digit_ok(m.group("doc"), m.group("doc_chk")):
+                    out["document_number"] = m.group("doc").replace("<", "")
+                nat = m.group("nat").replace("<", "")
+                if nat.isalpha() and len(nat) == 3:
+                    out["nationality"] = nat
+        if out:
+            return out
+    return None
+
+
 def extract_mrz(img: np.ndarray) -> ParsedMrz:
-    best_lines: list[str] = []
+    all_lines: list[list[str]] = []
     for variant in _preprocess_variants(img):
         lines = _ocr_candidate_lines(variant)
-        if len(lines) > len(best_lines):
-            best_lines = lines
+        if lines:
+            all_lines.append(lines)
         parsed = _try_parse_shape(lines)
         if parsed is not None:
             return parsed
+
+    # Strict parse failed everywhere - try relaxed positional extraction
+    # across every variant's lines, best (most fields) first.
+    best = None
+    for lines in all_lines:
+        relaxed = _relaxed_line2_extract(lines)
+        if relaxed and (best is None or len(relaxed) > len(best)):
+            best = relaxed
+    if best:
+        return ParsedMrz(mrz_type="TD3-RELAXED", fields=best, raw_mrz="")
 
     raise MrzNotFoundError(
         "No valid MRZ block could be found in the image. "
@@ -261,21 +361,27 @@ def _clean_name(value: str) -> str:
 
 def build_response_fields(parsed: ParsedMrz) -> dict:
     f = parsed.fields
-    surname = _clean_name(getattr(f, "surname", ""))
-    given_names = _clean_name(getattr(f, "name", ""))
-    sex = (getattr(f, "sex", "") or "").strip().upper()
+
+    def get(name):
+        if isinstance(f, dict):
+            return f.get(name, "")
+        return getattr(f, name, "")
+
+    surname = _clean_name(get("surname"))
+    given_names = _clean_name(get("name"))
+    sex = (get("sex") or "").strip().upper()
     if sex not in ("M", "F"):
         sex = "X"
 
     return {
         "surname": surname,
         "given_names": given_names,
-        "passport_number": (getattr(f, "document_number", "") or "").replace("<", "").strip(),
-        "nationality": (getattr(f, "nationality", "") or "").strip(),
-        "date_of_birth": _yymmdd_to_iso(getattr(f, "birth_date", ""), is_expiry=False),
+        "passport_number": (get("document_number") or "").replace("<", "").strip(),
+        "nationality": (get("nationality") or "").strip(),
+        "date_of_birth": _yymmdd_to_iso(get("birth_date"), is_expiry=False),
         "gender": sex,
-        "expiry_date": _yymmdd_to_iso(getattr(f, "expiry_date", ""), is_expiry=True),
-        "issuing_country": (getattr(f, "country", "") or "").strip(),
+        "expiry_date": _yymmdd_to_iso(get("expiry_date"), is_expiry=True),
+        "issuing_country": (get("country") or "").strip(),
     }
 
 
