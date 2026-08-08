@@ -9,3 +9,5 @@ numpy==2.2.6
 mrz==0.6.2
 requests==2.32.3
 pypdfium2==4.30.0
+paddlepaddle==2.6.2
+paddleocr==2.7.3

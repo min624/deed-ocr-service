@@ -437,38 +437,69 @@ def extract_viz_sex(img: np.ndarray) -> Optional[str]:
 # --------------------------------------------------------------------------
 
 
+def _paddle_fallback(img: np.ndarray) -> Optional[ParsedMrz]:
+    """Try PaddleOCR: strict MRZ parse on its lines, then relaxed, then VIZ sex."""
+    from app import paddle_engine
+
+    lines = paddle_engine.get_text_lines(img)
+    if not lines:
+        return None
+
+    mrz_lines = paddle_engine.mrz_candidate_lines(lines)
+    parsed = _try_parse_shape(mrz_lines)
+    if parsed is not None:
+        parsed.mrz_type = parsed.mrz_type + "-PADDLE"
+        return parsed
+
+    relaxed = _relaxed_line2_extract(mrz_lines)
+    if relaxed:
+        return ParsedMrz(mrz_type="TD3-RELAXED-PADDLE", fields=relaxed, raw_mrz="")
+
+    sex = paddle_engine.find_sex(lines)
+    if sex:
+        return ParsedMrz(mrz_type="VIZ-PADDLE", fields={"sex": sex}, raw_mrz="")
+    return None
+
+
 def parse_document(image_bytes: bytes) -> dict:
     """Full pipeline: raw image bytes -> structured MRZ response dict.
 
-    Falls back to visual-zone OCR of the printed Sex field when the MRZ is
-    unreadable or its gender character is garbled.
+    Tier 1: Tesseract MRZ (strict, then relaxed line-2).
+    Tier 2: PaddleOCR (strict MRZ, relaxed, printed Sex field).
+    Tier 3: Tesseract visual-zone Sex field.
     Raises an OcrError subclass on any handled failure.
     """
     img = load_image(image_bytes)
+    parsed = None
     try:
         parsed = extract_mrz(img)
     except MrzNotFoundError:
-        # MRZ unreadable - see if the printed Sex field is recoverable
-        sex = extract_viz_sex(img)
-        if sex:
-            return {
-                "success": True,
-                "mrz_type": "VIZ-ONLY",
-                "fields": {
-                    "surname": "", "given_names": "", "passport_number": "",
-                    "nationality": "", "date_of_birth": None,
-                    "gender": sex, "expiry_date": None, "issuing_country": "",
-                },
-                "raw_mrz": "",
-            }
-        raise
+        parsed = _paddle_fallback(img)
+        if parsed is None:
+            sex = extract_viz_sex(img)
+            if sex:
+                parsed = ParsedMrz(mrz_type="VIZ-ONLY", fields={"sex": sex}, raw_mrz="")
+        if parsed is None:
+            raise
 
     fields = build_response_fields(parsed)
     if fields.get("gender") == "X":
-        sex = extract_viz_sex(img)
-        if sex:
-            fields["gender"] = sex
-            fields["gender_source"] = "viz"
+        # MRZ read but gender garbled - try the stronger engine, then VIZ
+        better = _paddle_fallback(img)
+        if better is not None:
+            better_fields = build_response_fields(better)
+            if better_fields.get("gender") in ("M", "F"):
+                fields["gender"] = better_fields["gender"]
+                fields["gender_source"] = better.mrz_type
+                # Backfill anything else the stronger read recovered
+                for key, val in better_fields.items():
+                    if val and not fields.get(key):
+                        fields[key] = val
+        if fields.get("gender") == "X":
+            sex = extract_viz_sex(img)
+            if sex:
+                fields["gender"] = sex
+                fields["gender_source"] = "viz"
 
     return {
         "success": True,
