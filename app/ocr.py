@@ -461,12 +461,15 @@ def _paddle_fallback(img: np.ndarray) -> Optional[ParsedMrz]:
     return None
 
 
-def parse_document(image_bytes: bytes) -> dict:
+def parse_document(image_bytes: bytes, extract_viz_fields: bool = False) -> dict:
     """Full pipeline: raw image bytes -> structured MRZ response dict.
 
     Tier 1: Tesseract MRZ (strict, then relaxed line-2).
     Tier 2: PaddleOCR (strict MRZ, relaxed, printed Sex field).
     Tier 3: Tesseract visual-zone Sex field.
+
+    extract_viz_fields additionally runs PaddleOCR over the printed page to
+    recover Date of Issue and Place of Birth (not present in any MRZ).
     Raises an OcrError subclass on any handled failure.
     """
     img = load_image(image_bytes)
@@ -479,6 +482,12 @@ def parse_document(image_bytes: bytes) -> dict:
             sex = extract_viz_sex(img)
             if sex:
                 parsed = ParsedMrz(mrz_type="VIZ-ONLY", fields={"sex": sex}, raw_mrz="")
+        if parsed is None and extract_viz_fields:
+            # MRZ dead, but the printed page may still carry the VIZ fields
+            from app import paddle_engine
+            lines = paddle_engine.get_text_lines(img)
+            if lines and (paddle_engine.find_issue_date(lines) or paddle_engine.find_place_of_birth(lines)):
+                parsed = ParsedMrz(mrz_type="VIZ-ONLY", fields={}, raw_mrz="")
         if parsed is None:
             raise
 
@@ -500,6 +509,17 @@ def parse_document(image_bytes: bytes) -> dict:
             if sex:
                 fields["gender"] = sex
                 fields["gender_source"] = "viz"
+
+    if extract_viz_fields:
+        from app import paddle_engine
+        lines = paddle_engine.get_text_lines(img)
+        if lines:
+            issue = paddle_engine.find_issue_date(lines)
+            if issue:
+                fields["issue_date"] = issue
+            pob = paddle_engine.find_place_of_birth(lines)
+            if pob:
+                fields["place_of_birth"] = pob
 
     return {
         "success": True,

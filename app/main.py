@@ -59,6 +59,10 @@ class ParseBody(BaseModel):
     image_url: Optional[str] = Field(
         default=None, description="HTTP(S) URL to fetch the image from."
     )
+    extract_viz_fields: bool = Field(
+        default=False,
+        description="Also OCR the printed page for Date of Issue and Place of Birth (slower).",
+    )
 
 
 def _error_response(status_code: int, message: str) -> JSONResponse:
@@ -112,6 +116,7 @@ async def parse(request: Request, file: Optional[UploadFile] = File(default=None
     """
     try:
         image_bytes: Optional[bytes] = None
+        extract_viz_fields = False
 
         if file is not None:
             image_bytes = await file.read()
@@ -136,6 +141,7 @@ async def parse(request: Request, file: Optional[UploadFile] = File(default=None
                 )
 
             body = ParseBody(**payload)
+            extract_viz_fields = body.extract_viz_fields
             if body.image_base64:
                 image_bytes = _decode_base64_image(body.image_base64)
             elif body.image_url:
@@ -146,7 +152,7 @@ async def parse(request: Request, file: Optional[UploadFile] = File(default=None
                     "JSON body must include either 'image_base64' or 'image_url'.",
                 )
 
-        result = parse_document(image_bytes)
+        result = parse_document(image_bytes, extract_viz_fields=extract_viz_fields)
         return result
 
     except OcrError as exc:
