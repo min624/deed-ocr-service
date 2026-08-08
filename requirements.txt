@@ -4,8 +4,8 @@ python-multipart==0.0.17
 pydantic==2.10.3
 pillow==11.0.0
 pytesseract==0.3.13
-opencv-python-headless==4.13.0.92
-numpy==2.2.6
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
 mrz==0.6.2
 requests==2.32.3
 pypdfium2==4.30.0
