@@ -397,26 +397,34 @@ _VIZ_SEX_RE = re.compile(
 )
 
 
+VIZ_MAX_WIDTH = 1400  # cap resolution so the sparse-text pass stays fast
+
+
 def extract_viz_sex(img: np.ndarray) -> Optional[str]:
-    """Full-page OCR looking for the printed Sex field. Returns 'M'/'F' or None."""
-    img = _upscale_if_needed(img)
+    """Full-page OCR looking for the printed Sex field. Returns 'M'/'F' or None.
+
+    Kept deliberately cheap: downscaled image, two variants, no rotations
+    (EXIF orientation is already applied at load), --psm 6 which is much
+    faster than sparse-text mode on large pages.
+    """
+    h, w = img.shape[:2]
+    if w > VIZ_MAX_WIDTH:
+        scale = VIZ_MAX_WIDTH / float(w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
 
     votes = []
     for variant in (gray, clahe):
-        for rotated in (variant, cv2.rotate(variant, cv2.ROTATE_90_CLOCKWISE),
-                        cv2.rotate(variant, cv2.ROTATE_90_COUNTERCLOCKWISE)):
-            try:
-                text = pytesseract.image_to_string(rotated, config="--psm 11 --oem 3")
-            except Exception:  # noqa: BLE001
-                continue
-            m = _VIZ_SEX_RE.search(text)
-            if m:
-                votes.append(m.group(1).upper())
+        try:
+            text = pytesseract.image_to_string(variant, config="--psm 6 --oem 3")
+        except Exception:  # noqa: BLE001
+            continue
+        m = _VIZ_SEX_RE.search(text)
+        if m:
+            votes.append(m.group(1).upper())
     if not votes:
         return None
-    # Require agreement if we got multiple reads
     if votes.count("M") > votes.count("F"):
         return "M"
     if votes.count("F") > votes.count("M"):
