@@ -284,6 +284,10 @@ def classify_issue_date(all_dates, dob_iso, expiry_iso):
     candidate exactly 5 or 10 years before expiry, the usual passport terms.
     """
     from datetime import date as _date
+    # Without the checksum-validated expiry there is no anchor, and picking
+    # "the most recent past date" would be a guess. Refuse instead.
+    if not expiry_iso:
+        return None, ""
     today = _date.today().isoformat()
     cands = [d for d in all_dates if d != dob_iso and d != expiry_iso]
     cands = [d for d in cands if d <= today]
@@ -328,22 +332,41 @@ def _label_index(lines):
 
 _NOT_A_PLACE = {"male", "female", "sex", "date", "type", "code", "passport",
                 "authority", "signature", "holder", "copy", "national", "nationality",
-                "surname", "given", "names", "expiry", "issue"}
+                "surname", "given", "names", "expiry", "issue",
+                # the labels themselves - these leaked into results before
+                "place", "birth", "birh", "lieu", "naissance", "nacimiento", "lugar",
+                "pace", "plce", "mrz", "republic of", "kingdom of", "ministry"}
 
 
 def _plausible_place(v):
+    """Conservative: a wrong place of birth on a regulatory filing is worse
+    than a blank one, so anything ambiguous is rejected."""
     s = str(v or "").strip(" :;/.-,")
-    if len(s) < 4 or len(s) > 40:
+    if len(s) < 5 or len(s) > 40:
         return None
     if not re.match(r"^[A-Za-z][A-Za-z\s'.,\-]+$", s):
         return None
     low = s.lower()
     if any(w in low for w in _NOT_A_PLACE):
         return None
-    if not re.search(r"[aeiou]", low):
+    # real place names have at least two vowels
+    if len(re.findall(r"[aeiou]", low)) < 2:
         return None
-    if _repair_month(s[:3]) and len(s) <= 4:
+    # OCR noise often looks like 'iAll' or 'Ser M' - reject stray capitals
+    # mid-token and single trailing letters
+    if re.search(r"[A-Za-z]", s) and len(s.split()) <= 2:
         return None
+    if s[0].islower():
+        return None
+    if _repair_month(s[:3]) and len(s) <= 5:
+        return None
+    # OCR frequently welds neighbouring text onto the value ("Matisrael",
+    # "Pdoisrael"). If a country name is buried inside a longer token rather
+    # than being the whole token, treat it as a merge artifact and reject.
+    for cname in _COUNTRY_NAMES:
+        cl = cname.lower()
+        if cl in low and low != cl and len(low) > len(cl):
+            return None
     return s.strip()
 
 
