@@ -516,12 +516,32 @@ def parse_document(image_bytes: bytes, extract_viz_fields: bool = False, debug_t
         lines = paddle_engine.get_text_lines(img)
         raw_lines = lines
         if lines:
-            issue = paddle_engine.find_issue_date(lines)
+            # --- Date of issue, anchored on the MRZ rather than on a label ---
+            # The MRZ gives DOB and expiry with checksums. Any other past date
+            # on the page that sits between them is the issue date. This works
+            # even when the printed label is unreadable, which it usually is.
+            issue = paddle_engine.find_issue_date(lines)   # label-based, if it works
+            basis = "read next to the date-of-issue label" if issue else ""
+            if not issue:
+                all_dates = paddle_engine.find_all_dates(lines)
+                issue, basis = paddle_engine.classify_issue_date(
+                    all_dates, fields.get("date_of_birth"), fields.get("expiry_date")
+                )
+                fields["dates_seen"] = all_dates
             if issue:
                 fields["issue_date"] = issue
-            pob = paddle_engine.find_place_of_birth(lines)
+                fields["issue_date_basis"] = basis
+
+            # --- Place of birth, tolerant of mangled labels ---
+            exclude = [fields.get("nationality"), fields.get("issuing_country")]
+            pob, pob_basis = paddle_engine.find_place_of_birth_v2(lines, exclude=exclude)
+            if not pob:
+                legacy = paddle_engine.find_place_of_birth(lines)
+                if legacy:
+                    pob, pob_basis = legacy, "legacy label match"
             if pob:
                 fields["place_of_birth"] = pob
+                fields["place_of_birth_basis"] = pob_basis
 
     out = {
         "success": True,

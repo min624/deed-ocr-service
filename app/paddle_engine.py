@@ -189,3 +189,190 @@ def find_sex(lines: list[str]) -> Optional[str]:
                     if m2:
                         return m2.group(1).upper()
     return None
+
+
+# --------------------------------------------------------------------------
+# Label-independent field extraction
+#
+# Diagnosis (2026-08-10): on real passports the VALUES are large and read
+# cleanly, but the LABELS are small stylised multilingual print that OCR
+# mangles - "Place of Birth" -> "Place of Birh", "Place" -> "Pace",
+# "Date of Issue" -> "Dat". Anchoring on labels therefore loses data that is
+# plainly visible. These helpers anchor on the MRZ and on value shape instead.
+# --------------------------------------------------------------------------
+
+# Country names used only for the no-readable-label fallback. Kept local so
+# this module never imports from app.ocr (which would be circular).
+_COUNTRY_NAMES = [
+    "United Arab Emirates","Jordan","Sri Lanka","Syria","United Kingdom","India","Pakistan",
+    "Egypt","Saudi Arabia","United States","Germany","Kuwait","Palestine","Philippines",
+    "Nigeria","Canada","France","Australia","South Africa","Lebanon","Iraq","Yemen","Morocco",
+    "Tunisia","Algeria","Bahrain","Oman","Qatar","Turkey","Russia","China","Japan","South Korea",
+    "Bangladesh","Nepal","Afghanistan","Iran","Italy","Spain","Netherlands","Belgium",
+    "Switzerland","Sweden","Norway","Poland","Ukraine","Greece","Portugal","Ireland",
+    "New Zealand","Singapore","Malaysia","Indonesia","Thailand","Vietnam","Ethiopia","Kenya",
+    "Ghana","Sudan","Somalia","Libya","Cyprus","Maldives","Uganda","Tanzania","Myanmar",
+    "Hong Kong","Colombia","Israel","Cameroon","Eritrea","Azerbaijan","Kazakhstan","Uzbekistan",
+    "Czech Republic","Austria","Denmark","Finland","Hungary","Romania","Bulgaria","Croatia",
+    "Serbia","Brazil","Argentina","Mexico","Georgia","Armenia","Malta","Luxembourg","Estonia",
+    "Latvia","Lithuania",
+]
+
+_MONTHS3 = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+            "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+
+# OCR routinely swaps these glyphs inside month abbreviations
+_GLYPH_FIX = {"0":"O","1":"I","5":"S","8":"B","2":"Z","6":"G","4":"A"}
+
+
+def _repair_month(tok: str):
+    """Map a possibly-garbled 3-char month token to a month number."""
+    t = "".join(_GLYPH_FIX.get(c, c) for c in tok.upper())
+    if t in _MONTHS3:
+        return _MONTHS3[t]
+    # allow a single-character difference (e.g. 'NOU' -> 'NOV')
+    for name, num in _MONTHS3.items():
+        if len(t) == 3 and sum(1 for a, b in zip(t, name) if a != b) <= 1:
+            return num
+    return None
+
+
+_DATE_PATTERNS = [
+    # 06OCT2022 / 060CT2022 / 19AUG 2025 / 18 AUG2035
+    re.compile(r"(\d{1,2})\s*([A-Z0-9]{3})\s*(\d{4})", re.I),
+    # 10/08/2026, 10-08-2026, 10.08.2026
+    re.compile(r"(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})"),
+    # 2026-08-10
+    re.compile(r"(\d{4})[/.\-](\d{1,2})[/.\-](\d{1,2})"),
+]
+
+
+def find_all_dates(lines):
+    """Return every plausible date on the page as ISO strings, deduped."""
+    from datetime import date as _date
+    found = []
+    text = " ".join(lines)
+    for i, pat in enumerate(_DATE_PATTERNS):
+        for m in pat.finditer(text):
+            try:
+                if i == 0:
+                    d = int(m.group(1)); mon = _repair_month(m.group(2)); y = int(m.group(3))
+                elif i == 1:
+                    d = int(m.group(1)); mon = int(m.group(2)); y = int(m.group(3))
+                else:
+                    y = int(m.group(1)); mon = int(m.group(2)); d = int(m.group(3))
+            except (TypeError, ValueError):
+                continue
+            if not mon or not (1 <= mon <= 12) or not (1 <= d <= 31):
+                continue
+            if not (1900 <= y <= 2060):
+                continue
+            try:
+                iso = _date(y, mon, d).isoformat()
+            except ValueError:
+                continue
+            if iso not in found:
+                found.append(iso)
+    return found
+
+
+def classify_issue_date(all_dates, dob_iso, expiry_iso):
+    """Pick the issue date by elimination against the MRZ-verified dates.
+
+    The MRZ gives DOB and expiry with checksums, so whatever else appears on
+    the page and sits sensibly between them is the issue date. Prefers a
+    candidate exactly 5 or 10 years before expiry, the usual passport terms.
+    """
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    cands = [d for d in all_dates if d != dob_iso and d != expiry_iso]
+    cands = [d for d in cands if d <= today]
+    if dob_iso:
+        cands = [d for d in cands if d > dob_iso]
+    if expiry_iso:
+        cands = [d for d in cands if d < expiry_iso]
+    if not cands:
+        return None, ""
+    if expiry_iso:
+        for term in (10, 5, 7):
+            for d in cands:
+                try:
+                    if int(expiry_iso[:4]) - int(d[:4]) == term and d[5:7] == expiry_iso[5:7]:
+                        return d, "matched %d-year passport term against MRZ expiry" % term
+                except ValueError:
+                    continue
+    # otherwise the most recent qualifying date
+    cands.sort(reverse=True)
+    return cands[0], "only past date between MRZ date-of-birth and expiry"
+
+
+_LABEL_HINTS = ("place of birth", "lieu de naissance", "lugar de nacimiento",
+                "birth place", "place of birh", "pace of birth")
+
+
+def _label_index(lines):
+    """Fuzzy-locate the place-of-birth label, tolerating OCR damage."""
+    for i, line in enumerate(lines):
+        low = re.sub(r"[^a-z ]", "", line.lower())
+        for hint in _LABEL_HINTS:
+            if hint in low:
+                return i
+        # tolerate dropped characters: 'place of birh', 'pace', 'plce'
+        compact = low.replace(" ", "")
+        if ("birh" in compact or "birth" in compact or "naissance" in compact) and len(compact) <= 30:
+            return i
+        if compact.startswith("pace") or compact.startswith("plce"):
+            return i
+    return -1
+
+
+_NOT_A_PLACE = {"male", "female", "sex", "date", "type", "code", "passport",
+                "authority", "signature", "holder", "copy", "national", "nationality",
+                "surname", "given", "names", "expiry", "issue"}
+
+
+def _plausible_place(v):
+    s = str(v or "").strip(" :;/.-,")
+    if len(s) < 4 or len(s) > 40:
+        return None
+    if not re.match(r"^[A-Za-z][A-Za-z\s'.,\-]+$", s):
+        return None
+    low = s.lower()
+    if any(w in low for w in _NOT_A_PLACE):
+        return None
+    if not re.search(r"[aeiou]", low):
+        return None
+    if _repair_month(s[:3]) and len(s) <= 4:
+        return None
+    return s.strip()
+
+
+def find_place_of_birth_v2(lines, exclude=()):
+    """Value-first place-of-birth extraction.
+
+    Strategy 1: fuzzy-match the label, then take the best plausible value from
+                the following few lines (skipping short OCR noise like 'MAS').
+    Strategy 2: no usable label - accept a line that exactly names a known
+                country, provided it is not the document's own issuing country.
+    Returns (value, basis) or (None, "").
+    """
+    excl = set(str(e).strip().lower() for e in exclude if e)
+
+    idx = _label_index(lines)
+    if idx >= 0:
+        for j in range(idx, min(idx + 4, len(lines))):
+            candidate = lines[j]
+            if j == idx:
+                # value may sit after the label on the same line
+                parts = re.split(r"(?i)birh|birth|naissance|nacimiento|pace", candidate)
+                candidate = parts[-1] if len(parts) > 1 else ""
+            v = _plausible_place(candidate)
+            if v and v.lower() not in excl:
+                return v, "found next to the place-of-birth label"
+
+    known = {name.upper(): name for name in _COUNTRY_NAMES}
+    for line in lines:
+        s = str(line).strip(" :;/.-,").upper()
+        if s in known and s.lower() not in excl:
+            return known[s], "matched a country name on the page (no readable label)"
+    return None, ""
