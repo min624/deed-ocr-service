@@ -461,7 +461,7 @@ def _paddle_fallback(img: np.ndarray) -> Optional[ParsedMrz]:
     return None
 
 
-def parse_document(image_bytes: bytes, extract_viz_fields: bool = False) -> dict:
+def parse_document(image_bytes: bytes, extract_viz_fields: bool = False, debug_text: bool = False) -> dict:
     """Full pipeline: raw image bytes -> structured MRZ response dict.
 
     Tier 1: Tesseract MRZ (strict, then relaxed line-2).
@@ -510,9 +510,11 @@ def parse_document(image_bytes: bytes, extract_viz_fields: bool = False) -> dict
                 fields["gender"] = sex
                 fields["gender_source"] = "viz"
 
-    if extract_viz_fields:
+    raw_lines = []
+    if extract_viz_fields or debug_text:
         from app import paddle_engine
         lines = paddle_engine.get_text_lines(img)
+        raw_lines = lines
         if lines:
             issue = paddle_engine.find_issue_date(lines)
             if issue:
@@ -521,9 +523,13 @@ def parse_document(image_bytes: bytes, extract_viz_fields: bool = False) -> dict
             if pob:
                 fields["place_of_birth"] = pob
 
-    return {
+    out = {
         "success": True,
         "mrz_type": parsed.mrz_type,
         "fields": fields,
         "raw_mrz": parsed.raw_mrz,
     }
+    if debug_text:
+        out["raw_text_lines"] = raw_lines
+        out["raw_text_count"] = len(raw_lines)
+    return out
