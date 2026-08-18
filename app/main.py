@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import os
 from typing import Optional
 
 import requests
@@ -104,9 +105,23 @@ def _fetch_image_url(url: str) -> bytes:
     return content
 
 
+# Railway sets this at build time. Without it there is no way to tell whether a
+# push has actually reached the running container - a stale build silently kept
+# returning results from removed code after the 2026-08-18 fix was deployed.
+BUILD_COMMIT = (
+    os.environ.get("RAILWAY_GIT_COMMIT_SHA")
+    or os.environ.get("GIT_COMMIT_SHA")
+    or "unknown"
+)
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "deed-ocr-service"}
+    return {
+        "status": "ok",
+        "service": "deed-ocr-service",
+        "commit": BUILD_COMMIT[:12],
+    }
 
 
 @app.post("/parse")
