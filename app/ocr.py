@@ -486,7 +486,7 @@ def parse_document(image_bytes: bytes, extract_viz_fields: bool = False, debug_t
             # MRZ dead, but the printed page may still carry the VIZ fields
             from app import paddle_engine
             lines = paddle_engine.get_text_lines(img)
-            if lines and (paddle_engine.find_issue_date(lines) or paddle_engine.find_place_of_birth(lines)):
+            if lines and (paddle_engine.find_issue_date(lines) or paddle_engine.find_place_of_birth_v2(lines)[0]):
                 parsed = ParsedMrz(mrz_type="VIZ-ONLY", fields={}, raw_mrz="")
         if parsed is None:
             raise
@@ -534,11 +534,11 @@ def parse_document(image_bytes: bytes, extract_viz_fields: bool = False, debug_t
 
             # --- Place of birth, tolerant of mangled labels ---
             exclude = [fields.get("nationality"), fields.get("issuing_country")]
+            # No legacy label fallback here on purpose: the old label matcher
+            # returned whatever sat after a fuzzy "place"-ish token, which on
+            # these scans produced noise ("Lieu D", "Cop", "Pdoisrael"). On a
+            # regulatory filing a blank is correct and a wrong city is not.
             pob, pob_basis = paddle_engine.find_place_of_birth_v2(lines, exclude=exclude)
-            if not pob:
-                legacy = paddle_engine.find_place_of_birth(lines)
-                if legacy:
-                    pob, pob_basis = legacy, "legacy label match"
             if pob:
                 fields["place_of_birth"] = pob
                 fields["place_of_birth_basis"] = pob_basis
