@@ -335,7 +335,21 @@ _NOT_A_PLACE = {"male", "female", "sex", "date", "type", "code", "passport",
                 "surname", "given", "names", "expiry", "issue",
                 # the labels themselves - these leaked into results before
                 "place", "birth", "birh", "lieu", "naissance", "nacimiento", "lugar",
-                "pace", "plce", "mrz", "republic of", "kingdom of", "ministry"}
+                "pace", "plce", "mrz", "republic of", "kingdom of", "ministry",
+                # romanised labels from non-English documents: Shona and Swahili
+                "berekerwa", "kuzaliwa", "mahali", "tarehe", "geburtsort", "luogo"}
+
+# The country list alone does not catch a welded CITY ("Olondon", "Ammanul",
+# "Bengalurukarnataka"). These are checked the same way: a known place buried
+# inside a longer single token is a merge artifact, not a place.
+_PLACE_TOKENS = {"london", "amman", "bengaluru", "bangalore", "mumbai", "karnataka",
+                 "maharashtra", "kerala", "punjab", "gujarat", "dubai", "cairo",
+                 "beirut", "damascus", "delhi", "karachi", "lahore", "colombo",
+                 "manila", "lagos", "nairobi", "moscow", "paris", "berlin", "madrid",
+                 "athens", "istanbul", "tehran", "baghdad", "doha", "riyadh", "jeddah",
+                 "muscat", "manama", "khartoum", "mogadishu", "accra", "abuja",
+                 "dhaka", "chennai", "kolkata", "hyderabad", "aleppo", "jerusalem",
+                 "jakarta", "bangkok", "toronto", "sydney", "melbourne"}
 
 
 def _plausible_place(v):
@@ -367,6 +381,12 @@ def _plausible_place(v):
         cl = cname.lower()
         if cl in low and low != cl and len(low) > len(cl):
             return None
+    # same rule for cities, but only for single tokens - "Damascus Suburb" is a
+    # legitimate two-word value and must survive
+    if " " not in s.strip():
+        for city in _PLACE_TOKENS:
+            if city in low and low != city:
+                return None
     return s.strip()
 
 
