@@ -56,11 +56,12 @@ def get_text_lines(img: np.ndarray) -> list[str]:
         scale = MAX_WIDTH / float(w)
         img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-    try:
-        result = engine.ocr(img, cls=True)
-    except Exception:  # noqa: BLE001
-        logger.exception("PaddleOCR inference failed")
-        return []
+    with _lock:
+        try:
+            result = engine.ocr(img, cls=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("PaddleOCR inference failed")
+            return []
 
     lines = []
     for page in result or []:
@@ -139,33 +140,6 @@ def find_issue_date(lines: list[str]) -> Optional[str]:
                     return parsed
     return None
 
-
-_POB_VALUE_RE = re.compile(r"[A-Za-z][A-Za-z\s,.'\-]{2,39}")
-
-
-def find_place_of_birth(lines: list[str]) -> Optional[str]:
-    """Find the printed Place of Birth (Latin-script values only)."""
-    for i, line in enumerate(lines):
-        m = _POB_LABEL_RE.search(line)
-        if not m:
-            continue
-        # value on the same line after the label, else the next line
-        candidates = [line[m.end():]]
-        if i + 1 < len(lines):
-            candidates.append(lines[i + 1])
-        for cand in candidates:
-            cand = cand.strip(" :;/.-")
-            # skip if this is another label or mostly digits
-            if _POB_LABEL_RE.search(cand) or _ISSUE_LABEL_RE.search(cand):
-                continue
-            if sum(ch.isdigit() for ch in cand) > 2:
-                continue
-            vm = _POB_VALUE_RE.search(cand)
-            if vm:
-                value = vm.group(0).strip()
-                if len(value) >= 3 and value.upper() not in ("SEX", "DATE"):
-                    return value.title()
-    return None
 
 
 _SEX_RE = re.compile(r"\b(?:sex|sexe|sexo)\b[^A-Za-z0-9]{0,8}([MF])\b", re.IGNORECASE)
@@ -358,17 +332,19 @@ def _plausible_place(v):
     s = str(v or "").strip(" :;/.-,")
     if len(s) < 5 or len(s) > 40:
         return None
-    if not re.match(r"^[A-Za-z][A-Za-z\s'.,\-]+$", s):
+    if not re.match(r"^[A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F\s'.,\-]+$", s):
         return None
     low = s.lower()
     if any(w in low for w in _NOT_A_PLACE):
         return None
     # real place names have at least two vowels
-    if len(re.findall(r"[aeiou]", low)) < 2:
+    if len(re.findall(r"[aeiou\u00e0-\u00fc]", low)) < 2:
         return None
-    # OCR noise often looks like 'iAll' or 'Ser M' - reject stray capitals
-    # mid-token and single trailing letters
-    if re.search(r"[A-Za-z]", s) and len(s.split()) <= 2:
+    # OCR noise: stray lowercase-then-uppercase mid-token ("iAll", "kWa")
+    if re.search(r"[a-z][A-Z]", s):
+        return None
+    # OCR noise: isolated single letter in short values ("Ser M")
+    if re.search(r"\b[A-Za-z]\b", s) and len(s.split()) <= 2:
         return None
     if s[0].islower():
         return None

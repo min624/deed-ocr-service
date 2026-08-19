@@ -11,6 +11,7 @@ RUN apt-get update \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -22,14 +23,22 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download PaddleOCR models at build time so the first request is fast
-RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en', show_log=False)" || true
+# Pre-download PaddleOCR models at build time so the first request is fast.
+# This MUST succeed — a silent failure (|| true) defers model download to
+# the first request, which then times out under the n8n 30-45s OCR budget.
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en', show_log=False)"
+
+RUN useradd --system --no-create-home ocr
+USER ocr
 
 COPY app ./app
 
 # Railway injects PORT at runtime; default it for local `docker run`.
 ENV PORT=8000
 EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
 # Shell form so $PORT expands; Railway sets PORT, otherwise falls back to 8000.
 CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}

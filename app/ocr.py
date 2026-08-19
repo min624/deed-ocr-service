@@ -238,6 +238,10 @@ def _try_parse_shape(lines: list[str]) -> Optional[ParsedMrz]:
                 checker = checker_cls(mrz_text)
             except Exception:  # noqa: BLE001
                 continue
+            if not (checker.document_number_hash
+                    and checker.birth_date_hash
+                    and checker.expiry_date_hash):
+                continue
             fields = checker.fields()
             return ParsedMrz(mrz_type=mrz_type, fields=fields, raw_mrz=mrz_text)
     return None
@@ -437,11 +441,11 @@ def extract_viz_sex(img: np.ndarray) -> Optional[str]:
 # --------------------------------------------------------------------------
 
 
-def _paddle_fallback(img: np.ndarray) -> Optional[ParsedMrz]:
+def _paddle_fallback(img: np.ndarray, cached_lines: Optional[list] = None) -> Optional[ParsedMrz]:
     """Try PaddleOCR: strict MRZ parse on its lines, then relaxed, then VIZ sex."""
     from app import paddle_engine
 
-    lines = paddle_engine.get_text_lines(img)
+    lines = cached_lines if cached_lines is not None else paddle_engine.get_text_lines(img)
     if not lines:
         return None
 
@@ -473,19 +477,26 @@ def parse_document(image_bytes: bytes, extract_viz_fields: bool = False, debug_t
     Raises an OcrError subclass on any handled failure.
     """
     img = load_image(image_bytes)
+
+    from app import paddle_engine
+    _paddle_lines_cache = [None]
+
+    def _get_paddle_lines():
+        if _paddle_lines_cache[0] is None:
+            _paddle_lines_cache[0] = paddle_engine.get_text_lines(img)
+        return _paddle_lines_cache[0]
+
     parsed = None
     try:
         parsed = extract_mrz(img)
     except MrzNotFoundError:
-        parsed = _paddle_fallback(img)
+        parsed = _paddle_fallback(img, cached_lines=_get_paddle_lines())
         if parsed is None:
             sex = extract_viz_sex(img)
             if sex:
                 parsed = ParsedMrz(mrz_type="VIZ-ONLY", fields={"sex": sex}, raw_mrz="")
         if parsed is None and extract_viz_fields:
-            # MRZ dead, but the printed page may still carry the VIZ fields
-            from app import paddle_engine
-            lines = paddle_engine.get_text_lines(img)
+            lines = _get_paddle_lines()
             if lines and (paddle_engine.find_issue_date(lines) or paddle_engine.find_place_of_birth_v2(lines)[0]):
                 parsed = ParsedMrz(mrz_type="VIZ-ONLY", fields={}, raw_mrz="")
         if parsed is None:
@@ -493,14 +504,12 @@ def parse_document(image_bytes: bytes, extract_viz_fields: bool = False, debug_t
 
     fields = build_response_fields(parsed)
     if fields.get("gender") == "X":
-        # MRZ read but gender garbled - try the stronger engine, then VIZ
-        better = _paddle_fallback(img)
+        better = _paddle_fallback(img, cached_lines=_get_paddle_lines())
         if better is not None:
             better_fields = build_response_fields(better)
             if better_fields.get("gender") in ("M", "F"):
                 fields["gender"] = better_fields["gender"]
                 fields["gender_source"] = better.mrz_type
-                # Backfill anything else the stronger read recovered
                 for key, val in better_fields.items():
                     if val and not fields.get(key):
                         fields[key] = val
@@ -512,32 +521,29 @@ def parse_document(image_bytes: bytes, extract_viz_fields: bool = False, debug_t
 
     raw_lines = []
     if extract_viz_fields or debug_text:
-        from app import paddle_engine
-        lines = paddle_engine.get_text_lines(img)
+        lines = _get_paddle_lines()
         raw_lines = lines
         if lines:
-            # --- Date of issue, anchored on the MRZ rather than on a label ---
-            # The MRZ gives DOB and expiry with checksums. Any other past date
-            # on the page that sits between them is the issue date. This works
-            # even when the printed label is unreadable, which it usually is.
-            issue = paddle_engine.find_issue_date(lines)   # label-based, if it works
+            issue = paddle_engine.find_issue_date(lines)
             basis = "read next to the date-of-issue label" if issue else ""
             if not issue:
                 all_dates = paddle_engine.find_all_dates(lines)
                 issue, basis = paddle_engine.classify_issue_date(
                     all_dates, fields.get("date_of_birth"), fields.get("expiry_date")
                 )
-                fields["dates_seen"] = all_dates
             if issue:
                 fields["issue_date"] = issue
                 fields["issue_date_basis"] = basis
 
-            # --- Place of birth, tolerant of mangled labels ---
-            exclude = [fields.get("nationality"), fields.get("issuing_country")]
-            # No legacy label fallback here on purpose: the old label matcher
-            # returned whatever sat after a fuzzy "place"-ish token, which on
-            # these scans produced noise ("Lieu D", "Cop", "Pdoisrael"). On a
-            # regulatory filing a blank is correct and a wrong city is not.
+            # Strategy 2 of find_place_of_birth_v2 compares against full
+            # country names, so the exclude list must contain both the 3-letter
+            # codes from the MRZ and the resolved full names.
+            _ISO3_RESOLVE = {"ARE":"United Arab Emirates","JOR":"Jordan","LKA":"Sri Lanka","SYR":"Syria","GBR":"United Kingdom","IND":"India","PAK":"Pakistan","EGY":"Egypt","SAU":"Saudi Arabia","USA":"United States","DEU":"Germany","KWT":"Kuwait","PSE":"Palestine","PHL":"Philippines","NGA":"Nigeria","CAN":"Canada","FRA":"France","AUS":"Australia","ZAF":"South Africa","LBN":"Lebanon","IRQ":"Iraq","YEM":"Yemen","MAR":"Morocco","TUN":"Tunisia","DZA":"Algeria","BHR":"Bahrain","OMN":"Oman","QAT":"Qatar","TUR":"Turkey","RUS":"Russia","CHN":"China","JPN":"Japan","KOR":"South Korea","BGD":"Bangladesh","NPL":"Nepal","AFG":"Afghanistan","IRN":"Iran","ITA":"Italy","ESP":"Spain","NLD":"Netherlands","BEL":"Belgium","CHE":"Switzerland","SWE":"Sweden","NOR":"Norway","POL":"Poland","UKR":"Ukraine","GRC":"Greece","PRT":"Portugal","IRL":"Ireland","NZL":"New Zealand","SGP":"Singapore","MYS":"Malaysia","IDN":"Indonesia","THA":"Thailand","VNM":"Vietnam","ETH":"Ethiopia","KEN":"Kenya","GHA":"Ghana","SDN":"Sudan","SOM":"Somalia","LBY":"Libya","CYP":"Cyprus","MDV":"Maldives","UGA":"Uganda","TZA":"Tanzania","MMR":"Myanmar","HKG":"Hong Kong","COL":"Colombia","ISR":"Israel","CMR":"Cameroon","AZE":"Azerbaijan","KAZ":"Kazakhstan","UZB":"Uzbekistan","CZE":"Czech Republic","AUT":"Austria","DNK":"Denmark","FIN":"Finland","HUN":"Hungary","ROU":"Romania","BGR":"Bulgaria","BRA":"Brazil","ARG":"Argentina","MEX":"Mexico","GEO":"Georgia","ARM":"Armenia","MLT":"Malta","EST":"Estonia","LVA":"Latvia","LTU":"Lithuania","MUS":"Mauritius","SVK":"Slovakia","SVN":"Slovenia","HRV":"Croatia","SRB":"Serbia","ZWE":"Zimbabwe"}
+            nat_code = fields.get("nationality", "")
+            iss_code = fields.get("issuing_country", "")
+            exclude = [nat_code, iss_code,
+                       _ISO3_RESOLVE.get(nat_code.upper(), ""),
+                       _ISO3_RESOLVE.get(iss_code.upper(), "")]
             pob, pob_basis = paddle_engine.find_place_of_birth_v2(lines, exclude=exclude)
             if pob:
                 fields["place_of_birth"] = pob
