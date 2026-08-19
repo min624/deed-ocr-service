@@ -24,14 +24,15 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download PaddleOCR models at build time so the first request is fast.
-# This MUST succeed — a silent failure (|| true) defers model download to
-# the first request, which then times out under the n8n 30-45s OCR budget.
-RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en', show_log=False)"
-
-RUN useradd --system --no-create-home ocr
-USER ocr
+# || true kept: Railway's build network can be flaky, and a failed download
+# is recoverable at runtime (PaddleOCR retries on first inference).
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en', show_log=False)" || true
 
 COPY app ./app
+
+RUN useradd --system --no-create-home ocr \
+    && chown -R ocr:ocr /srv
+USER ocr
 
 # Railway injects PORT at runtime; default it for local `docker run`.
 ENV PORT=8000
