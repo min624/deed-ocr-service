@@ -396,12 +396,22 @@ def build_response_fields(parsed: ParsedMrz) -> dict:
 # "Sex" label variants across passports (English/French/Spanish), followed by
 # a short gap of separators, then a single M or F. The letter is Latin even on
 # Arabic-script passports.
+# NOTE: identical to paddle_engine._SEX_RE. Kept as a separate copy here to
+# avoid a cross-module import for a single regex; if the pattern ever needs
+# to change, update both.
 _VIZ_SEX_RE = re.compile(
     r"\b(?:sex|sexe|sexo)\b[^A-Za-z0-9]{0,8}([MF])\b", re.IGNORECASE
 )
 
 
 VIZ_MAX_WIDTH = 1400  # cap resolution so the sparse-text pass stays fast
+
+# ISO 3166-1 alpha-3 -> full country name, used only to resolve the
+# nationality/issuing-country codes from the MRZ into names so they can be
+# excluded from place-of-birth candidates (see parse_document below). Must
+# stay in sync with the names in paddle_engine._COUNTRY_NAMES. Module-level
+# so this large literal isn't rebuilt on every parse_document call.
+_ISO3_RESOLVE = {"ARE":"United Arab Emirates","JOR":"Jordan","LKA":"Sri Lanka","SYR":"Syria","GBR":"United Kingdom","IND":"India","PAK":"Pakistan","EGY":"Egypt","SAU":"Saudi Arabia","USA":"United States","DEU":"Germany","KWT":"Kuwait","PSE":"Palestine","PHL":"Philippines","NGA":"Nigeria","CAN":"Canada","FRA":"France","AUS":"Australia","ZAF":"South Africa","LBN":"Lebanon","IRQ":"Iraq","YEM":"Yemen","MAR":"Morocco","TUN":"Tunisia","DZA":"Algeria","BHR":"Bahrain","OMN":"Oman","QAT":"Qatar","TUR":"Turkey","RUS":"Russia","CHN":"China","JPN":"Japan","KOR":"South Korea","BGD":"Bangladesh","NPL":"Nepal","AFG":"Afghanistan","IRN":"Iran","ITA":"Italy","ESP":"Spain","NLD":"Netherlands","BEL":"Belgium","CHE":"Switzerland","SWE":"Sweden","NOR":"Norway","POL":"Poland","UKR":"Ukraine","GRC":"Greece","PRT":"Portugal","IRL":"Ireland","NZL":"New Zealand","SGP":"Singapore","MYS":"Malaysia","IDN":"Indonesia","THA":"Thailand","VNM":"Vietnam","ETH":"Ethiopia","KEN":"Kenya","GHA":"Ghana","SDN":"Sudan","SOM":"Somalia","LBY":"Libya","CYP":"Cyprus","MDV":"Maldives","UGA":"Uganda","TZA":"Tanzania","MMR":"Myanmar","HKG":"Hong Kong","COL":"Colombia","ISR":"Israel","CMR":"Cameroon","AZE":"Azerbaijan","KAZ":"Kazakhstan","UZB":"Uzbekistan","CZE":"Czech Republic","AUT":"Austria","DNK":"Denmark","FIN":"Finland","HUN":"Hungary","ROU":"Romania","BGR":"Bulgaria","BRA":"Brazil","ARG":"Argentina","MEX":"Mexico","GEO":"Georgia","ARM":"Armenia","MLT":"Malta","EST":"Estonia","LVA":"Latvia","LTU":"Lithuania","MUS":"Mauritius","SVK":"Slovakia","SVN":"Slovenia","HRV":"Croatia","SRB":"Serbia","ZWE":"Zimbabwe","ERI":"Eritrea","LUX":"Luxembourg"}
 
 
 def extract_viz_sex(img: np.ndarray) -> Optional[str]:
@@ -537,8 +547,8 @@ def parse_document(image_bytes: bytes, extract_viz_fields: bool = False, debug_t
 
             # Strategy 2 of find_place_of_birth_v2 compares against full
             # country names, so the exclude list must contain both the 3-letter
-            # codes from the MRZ and the resolved full names.
-            _ISO3_RESOLVE = {"ARE":"United Arab Emirates","JOR":"Jordan","LKA":"Sri Lanka","SYR":"Syria","GBR":"United Kingdom","IND":"India","PAK":"Pakistan","EGY":"Egypt","SAU":"Saudi Arabia","USA":"United States","DEU":"Germany","KWT":"Kuwait","PSE":"Palestine","PHL":"Philippines","NGA":"Nigeria","CAN":"Canada","FRA":"France","AUS":"Australia","ZAF":"South Africa","LBN":"Lebanon","IRQ":"Iraq","YEM":"Yemen","MAR":"Morocco","TUN":"Tunisia","DZA":"Algeria","BHR":"Bahrain","OMN":"Oman","QAT":"Qatar","TUR":"Turkey","RUS":"Russia","CHN":"China","JPN":"Japan","KOR":"South Korea","BGD":"Bangladesh","NPL":"Nepal","AFG":"Afghanistan","IRN":"Iran","ITA":"Italy","ESP":"Spain","NLD":"Netherlands","BEL":"Belgium","CHE":"Switzerland","SWE":"Sweden","NOR":"Norway","POL":"Poland","UKR":"Ukraine","GRC":"Greece","PRT":"Portugal","IRL":"Ireland","NZL":"New Zealand","SGP":"Singapore","MYS":"Malaysia","IDN":"Indonesia","THA":"Thailand","VNM":"Vietnam","ETH":"Ethiopia","KEN":"Kenya","GHA":"Ghana","SDN":"Sudan","SOM":"Somalia","LBY":"Libya","CYP":"Cyprus","MDV":"Maldives","UGA":"Uganda","TZA":"Tanzania","MMR":"Myanmar","HKG":"Hong Kong","COL":"Colombia","ISR":"Israel","CMR":"Cameroon","AZE":"Azerbaijan","KAZ":"Kazakhstan","UZB":"Uzbekistan","CZE":"Czech Republic","AUT":"Austria","DNK":"Denmark","FIN":"Finland","HUN":"Hungary","ROU":"Romania","BGR":"Bulgaria","BRA":"Brazil","ARG":"Argentina","MEX":"Mexico","GEO":"Georgia","ARM":"Armenia","MLT":"Malta","EST":"Estonia","LVA":"Latvia","LTU":"Lithuania","MUS":"Mauritius","SVK":"Slovakia","SVN":"Slovenia","HRV":"Croatia","SRB":"Serbia","ZWE":"Zimbabwe"}
+            # codes from the MRZ and the resolved full names. (_ISO3_RESOLVE
+            # is defined at module level above.)
             nat_code = fields.get("nationality", "")
             iss_code = fields.get("issuing_country", "")
             exclude = [nat_code, iss_code,

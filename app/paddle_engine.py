@@ -289,7 +289,12 @@ _LABEL_HINTS = ("place of birth", "lieu de naissance", "lugar de nacimiento",
 
 
 def _label_index(lines):
-    """Fuzzy-locate the place-of-birth label, tolerating OCR damage."""
+    """Fuzzy-locate the place-of-birth label, tolerating OCR damage.
+
+    Must require a PLACE-of-birth pattern, not just "birth" in isolation -
+    otherwise a readable "DATE OF BIRTH" label gets mistaken for the
+    place-of-birth label and extraction grabs the DOB value instead.
+    """
     for i, line in enumerate(lines):
         low = re.sub(r"[^a-z ]", "", line.lower())
         for hint in _LABEL_HINTS:
@@ -297,7 +302,9 @@ def _label_index(lines):
                 return i
         # tolerate dropped characters: 'place of birh', 'pace', 'plce'
         compact = low.replace(" ", "")
-        if ("birh" in compact or "birth" in compact or "naissance" in compact) and len(compact) <= 30:
+        has_birth_root = "birh" in compact or "birth" in compact or "naissance" in compact or "nacimiento" in compact
+        has_place_root = "place" in compact or "pace" in compact or "plce" in compact or "lieu" in compact or "lugar" in compact
+        if has_birth_root and has_place_root and len(compact) <= 30:
             return i
         if compact.startswith("pace") or compact.startswith("plce"):
             return i
